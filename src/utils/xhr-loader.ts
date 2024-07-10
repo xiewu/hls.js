@@ -234,7 +234,14 @@ class XhrLoader implements Loader<LoaderContext> {
             data: data,
             code: status,
           };
-
+          if (
+            context.rangeEnd &&
+            len !== context.rangeEnd - context.rangeStart!
+          ) {
+            logger.warn(
+              `Payload length ${len} does not match range requested bytes=${context.rangeStart}-${context.rangeEnd - 1}`,
+            );
+          }
           this.callbacks.onSuccess(response, stats, context, xhr);
         } else {
           const retryConfig = config.loadPolicy.errorRetry;

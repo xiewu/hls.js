@@ -443,7 +443,7 @@ export default class BaseStreamController
 
         if ('payload' in data) {
           this.log(
-            `Loaded ${frag.type} sn: ${frag.sn} of ${this.playlistLabel()} ${frag.level}`,
+            `Loaded ${frag.type} sn: ${frag.sn} of ${this.playlistLabel()} ${frag.level} (bytes ${frag.stats.loaded})`,
           );
           this.hls.trigger(Events.FRAG_LOADED, data);
         }
@@ -837,7 +837,7 @@ export default class BaseStreamController
     }
 
     this.log(
-      `Loading ${frag.type} sn: ${frag.sn} of ${this.fragInfo(frag, false)}) cc: ${frag.cc} ${
+      `Loading ${frag.type} sn: ${frag.sn} of ${this.fragInfo(frag, false)}${frag.byteRangeEndOffset ? ` range:${frag.byteRangeStartOffset}-${frag.byteRangeEndOffset}` : ''}) cc: ${frag.cc} ${
         details ? '[' + details.startSN + '-' + details.endSN + ']' : ''
       }, target: ${parseFloat(targetBufferTime.toFixed(3))}`,
     );
