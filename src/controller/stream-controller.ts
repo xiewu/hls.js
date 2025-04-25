@@ -3,7 +3,7 @@ import { findFragmentByPTS } from './fragment-finders';
 import { FragmentState } from './fragment-tracker';
 import { MAX_START_GAP_JUMP } from './gap-controller';
 import TransmuxerInterface from '../demux/transmuxer-interface';
-import { ErrorDetails } from '../errors';
+import { ErrorDetails, ErrorTypes } from '../errors';
 import { Events } from '../events';
 import { changeTypeSupported } from '../is-supported';
 import { ElementaryStreamTypes, isMediaFragment } from '../loader/fragment';
@@ -1532,6 +1532,18 @@ export default class StreamController
     this.fragPrevious = null;
     this.nextLoadPosition = frag.start;
     this.state = State.IDLE;
+    // Frag parsing error will force a level switch
+    const error = new Error(
+      `Backtrack for msn ${frag.sn} of level "${frag.level}"`,
+    );
+    this.hls.trigger(Events.ERROR, {
+      type: ErrorTypes.MEDIA_ERROR,
+      details: ErrorDetails.FRAG_PARSING_ERROR,
+      fatal: false,
+      error,
+      frag,
+      reason: error.message,
+    });
   }
 
   private checkFragmentChanged() {

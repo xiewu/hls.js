@@ -4,10 +4,9 @@ import {
 } from './mp4-remuxer';
 import { ElementaryStreamTypes } from '../loader/fragment';
 import { getCodecCompatibleName } from '../utils/codecs';
-import { type ILogger, logger } from '../utils/logger';
 import { patchEncyptionData } from '../utils/mp4-tools';
 import {
-  getDuration,
+  getSampleData,
   getStartDTS,
   offsetStartDTS,
   parseInitSegment,
@@ -29,6 +28,7 @@ import type {
 } from '../types/remuxer';
 import type { TrackSet } from '../types/track';
 import type { TypeSupported } from '../utils/codecs';
+import type { ILogger } from '../utils/logger';
 import type { InitData, InitDataTrack } from '../utils/mp4-tools';
 import type { RationalTimestamp } from '../utils/timescale-conversion';
 
@@ -41,6 +41,7 @@ class PassThroughRemuxer implements Remuxer {
   private initPTS: RationalTimestamp | null = null;
   private initTracks?: TrackSet;
   private lastEndTime: number | null = null;
+  private isVideoContiguous: boolean = false;
 
   constructor(
     observer: HlsEventEmitter,
@@ -59,6 +60,7 @@ class PassThroughRemuxer implements Remuxer {
   }
 
   public resetNextTimestamp() {
+    this.isVideoContiguous = false;
     this.lastEndTime = null;
   }
 
@@ -88,6 +90,7 @@ class PassThroughRemuxer implements Remuxer {
       audioCodec = getParsedTrackCodec(
         initData.audio,
         ElementaryStreamTypes.AUDIO,
+        this.logger,
       );
     }
 
@@ -95,6 +98,7 @@ class PassThroughRemuxer implements Remuxer {
       videoCodec = getParsedTrackCodec(
         initData.video,
         ElementaryStreamTypes.VIDEO,
+        this.logger,
       );
     }
 
@@ -182,7 +186,10 @@ class PassThroughRemuxer implements Remuxer {
       this.emitInitSegment = false;
     }
 
-    const duration = getDuration(data, initData);
+    const { duration, firstKeyFrame, sampleCount } = getSampleData(
+      data,
+      initData,
+    );
     const startDTS = getStartDTS(initData, data);
     const decodeTime = startDTS === null ? timeOffset : startDTS;
     if (
@@ -227,6 +234,7 @@ class PassThroughRemuxer implements Remuxer {
       type += 'video';
     }
 
+    const independent = firstKeyFrame !== -1;
     const track: RemuxedTrack = {
       data1: data,
       startPTS: startTime,
@@ -240,8 +248,33 @@ class PassThroughRemuxer implements Remuxer {
       dropped: 0,
     };
 
-    result.audio = track.type === 'audio' ? track : undefined;
-    result.video = track.type !== 'audio' ? track : undefined;
+    result.audio = hasAudio && !hasVideo ? track : undefined;
+    result.video = hasVideo ? track : undefined;
+    if (hasVideo && sampleCount) {
+      track.nb = sampleCount;
+      (track.dropped =
+        this.isVideoContiguous || firstKeyFrame === 0
+          ? 0
+          : firstKeyFrame === -1
+            ? sampleCount
+            : firstKeyFrame),
+        (track.independent = independent);
+      track.firstKeyFrame = firstKeyFrame;
+      if (independent && firstKeyFrame) {
+        track.firstKeyFramePTS =
+          startTime + (duration * firstKeyFrame) / sampleCount;
+      }
+      if (!this.isVideoContiguous) {
+        result.independent = independent;
+      }
+      this.isVideoContiguous ||= independent;
+      if (track.dropped) {
+        this.logger.warn(
+          `fmp4 does not start with IDR: firstIDR ${firstKeyFrame}/${sampleCount} dropped: ${track.dropped} pts: ${track.firstKeyFramePTS || 'NA'}`,
+        );
+      }
+    }
+
     result.initSegment = initSegment;
     result.id3 = flushTextTrackMetadataCueSamples(
       id3Track,
@@ -280,6 +313,7 @@ function isInvalidInitPts(
 function getParsedTrackCodec(
   track: InitDataTrack,
   type: ElementaryStreamTypes.AUDIO | ElementaryStreamTypes.VIDEO,
+  logger: ILogger,
 ): string {
   const parsedCodec = track?.codec;
   if (parsedCodec && parsedCodec.length > 4) {
