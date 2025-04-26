@@ -7,7 +7,6 @@ import { getCodecCompatibleName } from '../utils/codecs';
 import { patchEncyptionData } from '../utils/mp4-tools';
 import {
   getSampleData,
-  getStartDTS,
   offsetStartDTS,
   parseInitSegment,
 } from '../utils/mp4-tools';
@@ -186,12 +185,30 @@ class PassThroughRemuxer implements Remuxer {
       this.emitInitSegment = false;
     }
 
-    const { duration, firstKeyFrame, sampleCount } = getSampleData(
-      data,
-      initData,
-    );
-    const startDTS = getStartDTS(initData, data);
-    const decodeTime = startDTS === null ? timeOffset : startDTS;
+    const trackSampleData = getSampleData(data, initData);
+    const audioSampleTimes = initData.audio
+      ? trackSampleData[initData.audio.id]
+      : null;
+    const videoSampleTimes = initData.video
+      ? trackSampleData[initData.video.id]
+      : null;
+    // { duration, firstKeyFrame, sampleCount, sampleStartTime }
+    const videoStartTime =
+      videoSampleTimes?.start !== undefined
+        ? videoSampleTimes.start / videoSampleTimes.timescale
+        : Infinity;
+    const audioStartTime =
+      audioSampleTimes?.start !== undefined
+        ? audioSampleTimes.start / audioSampleTimes.timescale
+        : Infinity;
+    const sampleStartTime = this.isVideoContiguous
+      ? videoStartTime
+      : Math.min(audioStartTime, videoStartTime);
+    const decodeTime = Number.isFinite(sampleStartTime)
+      ? sampleStartTime
+      : timeOffset;
+    const duration =
+      videoSampleTimes?.duration || audioSampleTimes?.duration || 0;
     if (
       (accurateTimeOffset || !initPTS) &&
       (isInvalidInitPts(initPTS, decodeTime, timeOffset, duration) ||
@@ -208,13 +225,14 @@ class PassThroughRemuxer implements Remuxer {
         timescale: 1,
       };
     }
-
+    const baseTime = Number.isFinite(videoStartTime)
+      ? videoStartTime
+      : decodeTime;
     const startTime = audioTrack
-      ? decodeTime - initPTS.baseTime / initPTS.timescale
+      ? baseTime - initPTS.baseTime / initPTS.timescale
       : (lastEndTime as number);
-    const endTime = startTime + duration;
     offsetStartDTS(initData, data, initPTS.baseTime / initPTS.timescale);
-
+    const endTime = startTime + duration;
     if (duration > 0) {
       this.lastEndTime = endTime;
     } else {
@@ -234,13 +252,25 @@ class PassThroughRemuxer implements Remuxer {
       type += 'video';
     }
 
-    const independent = firstKeyFrame !== -1;
+    const endDTS =
+      Math.max(
+        videoSampleTimes
+          ? (videoSampleTimes.start || 0) / videoSampleTimes.timescale +
+              videoSampleTimes.duration
+          : 0,
+        audioSampleTimes
+          ? (audioSampleTimes.start || 0) / audioSampleTimes.timescale +
+              audioSampleTimes.duration
+          : 0,
+      ) -
+      initPTS.baseTime / initPTS.timescale;
+
     const track: RemuxedTrack = {
       data1: data,
       startPTS: startTime,
       startDTS: startTime,
-      endPTS: endTime,
-      endDTS: endTime,
+      endPTS: endDTS,
+      endDTS: endDTS,
       type,
       hasAudio,
       hasVideo,
@@ -250,19 +280,23 @@ class PassThroughRemuxer implements Remuxer {
 
     result.audio = hasAudio && !hasVideo ? track : undefined;
     result.video = hasVideo ? track : undefined;
-    if (hasVideo && sampleCount) {
-      track.nb = sampleCount;
+    const videoSampleCount = videoSampleTimes?.sampleCount;
+    if (videoSampleCount) {
+      const firstKeyFrame = videoSampleTimes.firstKeyFrame;
+      const independent = firstKeyFrame !== -1;
+      track.nb = videoSampleCount;
       (track.dropped =
         this.isVideoContiguous || firstKeyFrame === 0
           ? 0
           : firstKeyFrame === -1
-            ? sampleCount
+            ? videoSampleCount
             : firstKeyFrame),
         (track.independent = independent);
       track.firstKeyFrame = firstKeyFrame;
-      if (independent && firstKeyFrame) {
+      if (independent && videoSampleTimes.firstKeyFrameTs) {
         track.firstKeyFramePTS =
-          startTime + (duration * firstKeyFrame) / sampleCount;
+          videoSampleTimes.firstKeyFrameTs -
+          initPTS.baseTime / initPTS.timescale;
       }
       if (!this.isVideoContiguous) {
         result.independent = independent;
@@ -270,7 +304,7 @@ class PassThroughRemuxer implements Remuxer {
       this.isVideoContiguous ||= independent;
       if (track.dropped) {
         this.logger.warn(
-          `fmp4 does not start with IDR: firstIDR ${firstKeyFrame}/${sampleCount} dropped: ${track.dropped} pts: ${track.firstKeyFramePTS || 'NA'}`,
+          `fmp4 does not start with IDR: firstIDR ${firstKeyFrame}/${videoSampleCount} dropped: ${track.dropped} pts: ${track.firstKeyFramePTS || 'NA'}`,
         );
       }
     }

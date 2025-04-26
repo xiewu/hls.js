@@ -620,80 +620,6 @@ export function parseSinf(sinf: Uint8Array): Uint8Array | null {
   return null;
 }
 
-/**
- * Determine the base media decode start time, in seconds, for an MP4
- * fragment. If multiple fragments are specified, the earliest time is
- * returned.
- *
- * The base media decode time can be parsed from track fragment
- * metadata:
- * ```
- * moof > traf > tfdt.baseMediaDecodeTime
- * ```
- * It requires the timescale value from the mdhd to interpret.
- *
- * @param initData - a hash of track type to timescale values
- * @param fmp4 - the bytes of the mp4 fragment
- * @returns the earliest base media decode start time for the
- * fragment, in seconds
- */
-export function getStartDTS(
-  initData: InitData,
-  fmp4: Uint8Array,
-): number | null {
-  // we need info from two children of each track fragment box
-  return findBox(fmp4, ['moof', 'traf']).reduce(
-    (result: number | null, traf) => {
-      const tfdt = findBox(traf, ['tfdt'])[0];
-      const version = tfdt[0];
-      const start = findBox(traf, ['tfhd']).reduce(
-        (result: number | null, tfhd) => {
-          // get the track id from the tfhd
-          const id = readUint32(tfhd, 4);
-          const track = initData[id];
-          if (track) {
-            let baseTime = readUint32(tfdt, 4);
-            if (version === 1) {
-              // If value is too large, assume signed 64-bit. Negative track fragment decode times are invalid, but they exist in the wild.
-              // This prevents large values from being used for initPTS, which can cause playlist sync issues.
-              // https://github.com/video-dev/hls.js/issues/5303
-              if (baseTime === UINT32_MAX) {
-                logger.warn(
-                  `[mp4-demuxer]: Ignoring assumed invalid signed 64-bit track fragment decode time`,
-                );
-                return result;
-              }
-              baseTime *= UINT32_MAX + 1;
-              baseTime += readUint32(tfdt, 8);
-            }
-            // assume a 90kHz clock if no timescale was specified
-            const scale = track.timescale || 90e3;
-            // convert base time to seconds
-            const startTime = baseTime / scale;
-            if (
-              Number.isFinite(startTime) &&
-              (result === null || startTime < result)
-            ) {
-              return startTime;
-            }
-          }
-          return result;
-        },
-        null,
-      );
-      if (
-        start !== null &&
-        Number.isFinite(start) &&
-        (result === null || start < result)
-      ) {
-        return start;
-      }
-      return result;
-    },
-    null,
-  );
-}
-
 /*
   For Reference:
   aligned(8) class TrackFragmentHeaderBox
@@ -707,19 +633,21 @@ export function getStartDTS(
      unsigned int(32)  default_sample_flags
   }
  */
+type TrackTimes = {
+  duration: number;
+  firstKeyFrame?: number;
+  firstKeyFrameTs?: number;
+  start?: number;
+  sampleCount: number;
+  timescale: number;
+  type: HdlrType;
+};
+
 export function getSampleData(
   data: Uint8Array,
   initData: InitData,
-): {
-  duration: number;
-  firstKeyFrame?: number;
-  sampleCount?: number;
-} {
-  let rawDuration = 0;
-  let videoDuration = 0;
-  let audioDuration = 0;
-  let firstKeyFrame: number | undefined;
-  let sampleCount: number | undefined;
+): Record<number, TrackTimes> {
+  const tracks: Record<number, TrackTimes> = {};
   const trafs = findBox(data, ['moof', 'traf']);
   for (let i = 0; i < trafs.length; i++) {
     const traf = trafs[i];
@@ -734,29 +662,65 @@ export function getSampleData(
     if (!track) {
       continue;
     }
+    let rawDuration = 0;
+    let sampleCount: number | undefined;
+    let firstKeyFrame: number | undefined;
+    const trackTimes: TrackTimes = (tracks[id] = {
+      duration: 0,
+      sampleCount: 0,
+      timescale: track.timescale,
+      type: track.type,
+    });
+    // get start DTS
+    const tfdt = findBox(traf, ['tfdt'])[0];
+
+    if (tfdt) {
+      const version = tfdt[0];
+      let baseTime = readUint32(tfdt, 4);
+      if (version === 1) {
+        // If value is too large, assume signed 64-bit. Negative track fragment decode times are invalid, but they exist in the wild.
+        // This prevents large values from being used for initPTS, which can cause playlist sync issues.
+        // https://github.com/video-dev/hls.js/issues/5303
+        if (baseTime === UINT32_MAX) {
+          logger.warn(
+            `[mp4-demuxer]: Ignoring assumed invalid signed 64-bit track fragment decode time`,
+          );
+        } else {
+          baseTime *= UINT32_MAX + 1;
+          baseTime += readUint32(tfdt, 8);
+        }
+      }
+      if (Number.isFinite(baseTime)) {
+        trackTimes.start = baseTime;
+      }
+    }
+
     const trackDefault = track.default;
     const tfhdFlags = readUint32(tfhd, 0) | trackDefault?.flags!;
-    let sampleDuration: number | undefined = trackDefault?.duration;
+    let defaultSampleDuration: number = trackDefault?.duration || 0;
     if (tfhdFlags & 0x000008) {
       // 0x000008 indicates the presence of the default_sample_duration field
       if (tfhdFlags & 0x000002) {
         // 0x000002 indicates the presence of the sample_description_index field, which precedes default_sample_duration
         // If present, the default_sample_duration exists at byte offset 12
-        sampleDuration = readUint32(tfhd, 12);
+        defaultSampleDuration = readUint32(tfhd, 12);
       } else {
         // Otherwise, the duration is at byte offset 8
-        sampleDuration = readUint32(tfhd, 8);
+        defaultSampleDuration = readUint32(tfhd, 8);
       }
     }
     // assume a 90kHz clock if no timescale was specified
     const timescale = track.timescale || 90e3;
     const truns = findBox(traf, ['trun']);
+    let sampleDTS = trackTimes.start || 0;
+    let sampleDuration = defaultSampleDuration;
     for (let j = 0; j < truns.length; j++) {
       const trun = truns[j];
       rawDuration = computeRawDurationFromSamples(trun);
-      if (!rawDuration && sampleDuration) {
-        const sampleCount = readUint32(trun, 4);
-        rawDuration = sampleDuration * sampleCount;
+      sampleCount = readUint32(trun, 4);
+      trackTimes.sampleCount += sampleCount;
+      if (!rawDuration && defaultSampleDuration) {
+        rawDuration = defaultSampleDuration * sampleCount;
       }
       if (track.type === ElementaryStreamTypes.VIDEO) {
         if (firstKeyFrame === undefined) {
@@ -768,7 +732,6 @@ export function getSampleData(
         const sampleSizePresent = trun[2] & 0x02;
         const sampleFlagsPresent = trun[2] & 0x04;
         const sampleCompositionTimeOffsetPresent = trun[2] & 0x08;
-        sampleCount = readUint32(trun, 4);
         let offset = 8;
         let remaining = sampleCount;
         if (dataOffsetPresent) {
@@ -781,7 +744,10 @@ export function getSampleData(
           }
           offset += 4;
           if (sampleDurationPresent) {
+            sampleDuration = readUint32(trun, offset);
             offset += 4;
+          } else {
+            sampleDuration = defaultSampleDuration;
           }
           if (sampleSizePresent) {
             offset += 4;
@@ -789,11 +755,15 @@ export function getSampleData(
           if (sampleCompositionTimeOffsetPresent) {
             offset += 4;
           }
+          sampleDTS += sampleDuration;
           remaining--;
         }
         while (remaining--) {
           if (sampleDurationPresent) {
+            sampleDuration = readUint32(trun, offset);
             offset += 4;
+          } else {
+            sampleDuration = defaultSampleDuration;
           }
           if (sampleSizePresent) {
             offset += 4;
@@ -803,6 +773,7 @@ export function getSampleData(
             if (!isNonSyncSample) {
               if (firstKeyFrame === -1) {
                 firstKeyFrame = sampleCount - (remaining + 1);
+                trackTimes.firstKeyFrameTs = sampleDTS;
               }
             }
             offset += 4;
@@ -810,14 +781,14 @@ export function getSampleData(
           if (sampleCompositionTimeOffsetPresent) {
             offset += 4;
           }
+          sampleDTS += sampleDuration;
         }
-        videoDuration += rawDuration / timescale;
-      } else if (track.type === ElementaryStreamTypes.AUDIO) {
-        audioDuration += rawDuration / timescale;
+        trackTimes.firstKeyFrame = firstKeyFrame;
       }
+      trackTimes.duration += rawDuration / timescale;
     }
   }
-  if (videoDuration === 0 && audioDuration === 0) {
+  if (!Object.keys(tracks).some((trackId) => tracks[trackId].duration)) {
     // If duration samples are not available in the traf use sidx subsegment_duration
     let sidxMinStart = Infinity;
     let sidxMaxEnd = 0;
@@ -842,21 +813,12 @@ export function getSampleData(
       }
     }
     if (duration && Number.isFinite(duration)) {
-      return {
-        duration,
-      };
+      Object.keys(tracks).forEach((trackId) => {
+        tracks[trackId].duration = duration;
+      });
     }
   }
-  if (videoDuration) {
-    return {
-      duration: videoDuration,
-      firstKeyFrame,
-      sampleCount,
-    };
-  }
-  return {
-    duration: audioDuration,
-  };
+  return tracks;
 }
 
 /*
