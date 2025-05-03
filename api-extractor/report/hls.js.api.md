@@ -2550,6 +2550,8 @@ export interface InitSegmentData {
     // (undocumented)
     timescale: number | undefined;
     // (undocumented)
+    trackId: number | undefined;
+    // (undocumented)
     tracks?: TrackSet;
 }
 
